@@ -1,0 +1,43 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+build/
+dist/
+.pytest_cache/
+.ruff_cache/
+
+# Runtime state and secrets
+output/*
+!output/.gitkeep
+*.bin
+*.pem
+*.key
+*.jwt
+*.jwk
+*.p12
+*.pcap
+*.pcapng
+*.mitm
+state.json
+network/
+dumps/
+
+# Public certificate authorities that ARE part of the package
+!src/blueair_cloudcutter/data/roots/*.pem
+
+# Editors / OS
+.DS_Store
+.idea/
+.vscode/
+
+# Firmware binaries are user-supplied
+firmwares/*
+!firmwares/README.md
+!firmwares/*.yaml
+!firmwares/*.yml
+
+.claude
+.opencode

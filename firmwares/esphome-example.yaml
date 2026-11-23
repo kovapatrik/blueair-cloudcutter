@@ -1,0 +1,801 @@
+# ESPHome configuration example for the BlueAir purifier.
+#
+# Replace this placeholder with a working configuration for your board, then
+# build the OTA image and copy it into this folder:
+#
+#   esphome compile esphome-example.yaml
+#   cp <build-dir>/firmware.bin firmwares/
+#
+# Pass only the filename to the tool:
+#
+#   ./blueair-cloudcutter.sh exploit --firmware firmware.bin --ssid "..." --password "..."
+#
+# ESP32 air purifier -- ESPHome replacement firmware
+#
+# Hardware: ESP32-WROVER-E, AiP6120 10-channel serial driver, Cubic PM1003
+# particulate sensor (speaks the PM1006 protocol), 24C32A EEPROM, ICMAN SC02A
+# capacitive touch front-end.
+#
+# Pin map, timings and thresholds are all derived from the stock firmware and
+# then confirmed on hardware; the derivations are written up in
+# ../21-gpio-mapping.md. Items marked [GAP] are stock behaviour deliberately
+# not reproduced here.
+
+substitutions:
+  name: air-purifier
+  # Fan overcurrent cut-out, volts at the current-sense ADC.
+  #
+  # This board's motor is stock "type 1", identified from measurements:
+  #   - RPM at 91 % duty was 1682; the stock table gives 1720 (t1) / 1520 (t2)
+  #     / 1640 (t3), so t1 or t3.
+  #   - measured current peaks at 1.52 V; t3's 0.69 V limit would trip at
+  #     roughly 55 % duty, which would make the fan unusable. So t1.
+  # Type 1's limit is 1.72 V, sitting ~13 % above the 1.52 V normal maximum.
+  #
+  # Measured curve: 1 % 0.11 V, 11 % 0.11 V, 51 % 0.51 V, 91 % 1.49 V,
+  # 100 % 1.51 V.
+  overcurrent_volts: "1.72"
+
+  # --- Filter life ---------------------------------------------------------
+  # Dust capacity in micrograms. Firmware constant selected by type byte 0x1B
+  # (7 / 8 / 9 / 12 million for types 1-4); this unit is type 1, the same byte
+  # that selects the motor RPM table and the overcurrent limit.
+  filter_capacity_ug: "7000000"
+
+esphome:
+  name: ${name}
+  on_boot:
+    priority: -100
+    then:
+      # The particulate sensor is power-gated on Q1 and needs a warm-up.
+      - output.turn_on: sensor_power
+
+esp32:
+  board: esp32dev
+  flash_size: 8MB
+  framework:
+    type: esp-idf
+    advanced:
+      minimum_chip_revision: "3.1"
+    sdkconfig_options:
+      CONFIG_PARTITION_TABLE_OFFSET: "0x9000"
+      CONFIG_SECURE_FLASH_ENC_ENABLED: y
+      CONFIG_SECURE_FLASH_ENCRYPTION_MODE_DEVELOPMENT: y
+      CONFIG_NVS_COMPATIBLE_PRE_V4_3_ENCRYPTION_FLAG: y
+      # Bootloader size must be small enough to compile, but this won't ever
+      # be flashed, so it doesn't really matter
+      CONFIG_BOOTLOADER_LOG_LEVEL_NONE: y
+      CONFIG_BOOTLOADER_LOG_LEVEL: "0"
+      CONFIG_BOOTLOADER_COMPILER_OPTIMIZATION_SIZE: y
+
+external_components:
+  - source: github://kovapatrik/esphome-aip6120
+    components: [aip6120]
+
+logger:
+  # GPIO1/GPIO3 (UART0) are free -- no peripherals use them.
+
+api:
+  reboot_timeout: 0s
+
+ota:
+  - platform: esphome
+    password: !secret ota_password
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+  ap:
+    ssid: "${name} fallback"
+
+captive_portal:
+
+web_server:
+  port: 80
+
+
+# ---------------------------------------------------------------------------
+# AiP6120 10-channel serial driver (GPIO23 = DATA, GPIO25 = CLK)
+#
+# Channel = Q number on the datasheet. Outputs are N-channel open drain, so
+# "on" means the channel sinks current from COM through its load.
+#
+#   Q1  particulate sensor power     Q6   panel lamp "Speed 3"
+#   Q2  unused / unknown             Q7   panel lamp "Sleep"
+#   Q3  ionizer                      Q8   panel lamp "Filter" (red)
+#   Q4  panel lamp "Speed 1"         Q9   panel lamp "Auto"
+#   Q5  panel lamp "Speed 2"         Q10  fan enable
+#
+# All lamps are gated by the Panel Brightness PWM, which feeds the COM rail.
+# ---------------------------------------------------------------------------
+globals:
+  # Accumulated particulate mass captured, in micrograms. Persisted to NVS,
+  # so it survives reboots -- the stock counter in the EEPROM is left alone.
+  - id: filter_used_ug
+    type: float
+    restore_value: true
+    initial_value: '0'
+
+  # Consecutive over-limit fan-current readings. Mirrors stock's strike
+  # counter: 3 in a row trips, any value under the limit resets it.
+  - id: oc_strikes
+    type: int
+    restore_value: false
+    initial_value: '0'
+
+aip6120:
+  - id: driver
+    data_pin: GPIO23
+    clock_pin: GPIO25
+
+output:
+  - platform: aip6120
+    id: sensor_power
+    aip6120_id: driver
+    channel: 1
+  - platform: aip6120
+    id: ionizer_output
+    aip6120_id: driver
+    channel: 3
+  - platform: aip6120
+    id: fan_enable
+    aip6120_id: driver
+    channel: 10
+
+  # Panel lamps, all identified on hardware.
+  - platform: aip6120
+    id: lamp_speed3
+    aip6120_id: driver
+    channel: 6
+  - platform: aip6120
+    id: lamp_speed2
+    aip6120_id: driver
+    channel: 5
+  - platform: aip6120
+    id: lamp_speed1
+    aip6120_id: driver
+    channel: 4
+  - platform: aip6120
+    id: lamp_auto
+    aip6120_id: driver
+    channel: 9
+  - platform: aip6120
+    id: lamp_sleep
+    aip6120_id: driver
+    channel: 7
+  - platform: aip6120
+    id: lamp_filter
+    aip6120_id: driver
+    channel: 8
+
+  # --- Fan PWM --------------------------------------------------------------
+  # --- LEDC channel/timer assignment ----------------------------------------
+  # LEDC channels are paired onto shared timers: timer = (channel % 8) / 2,
+  # so ch0+ch1 -> timer0, ch2+ch3 -> timer1, ch4+ch5 -> timer2, ch6+ch7 ->
+  # timer3. Two channels on the same timer CANNOT have different frequencies --
+  # whichever is configured last wins and silently changes the other.
+  #
+  # ESPHome assigns channels sequentially in declaration order and does NOT
+  # take frequency into account, so the fan (15 kHz) would otherwise share
+  # timer0 with an RGB channel (5 kHz) and get dragged down to 5 kHz.
+  # Channels are therefore pinned explicitly:
+  #
+  #   ch0  timer0  fan       15 kHz   (ch1 left unused on purpose)
+  #   ch2  timer1  rgb_r      5 kHz
+  #   ch3  timer1  rgb_g      5 kHz
+  #   ch4  timer2  rgb_b      5 kHz
+  #   ch5  timer2  indicator  5 kHz
+  #   ch6  timer3  backlight  5 kHz   (ch7 spare)
+  #
+  # Do not reorder or add ledc outputs without re-checking this table.
+
+  # Stock drives this from MCPWM at 15 kHz, up-counter, active high. LEDC
+  # reproduces it; ESPHome has no MCPWM output platform. 15 kHz is not one of
+  # LEDC's "clean" frequencies (19531 Hz is exactly 12-bit) but ESPHome picks
+  # the bit depth automatically and 12-bit/4096 steps is ample for a fan.
+  # Keeping stock's frequency because the fan's input stage was designed for it.
+  - platform: ledc
+    id: fan_pwm
+    pin: GPIO33
+    channel: 0
+    frequency: 15000Hz
+    # min_power/max_power deliberately NOT set. ESPHome maps them as
+    #     duty = min_power + slider * (max_power - min_power)
+    # so min_power: 0.01 + max_power: 0.91 made slider % != duty %:
+    # slider 51 % gave 46.9 % duty, slider 91 % gave 82.9 %, and the slider
+    # topped out at 91 %. Leaving both unset makes slider % == duty % exactly,
+    # which is what a free 0-100 % control should do and what the fan speed
+    # presets below assume.
+    #
+    # Note stock never exceeded 91 % duty. If Fan Current at 100 % turns out
+    # high, add `max_power: 0.91` back -- but then re-check the preset script,
+    # because it will rescale the slider again.
+    zero_means_zero: true
+
+  # --- LED PWM (LEDC, 5 kHz, 13-bit in stock) -------------------------------
+  # Colour order confirmed on hardware.
+  #
+  # The RGB ring is the Air Quality Indicator. Its colours come from an
+  # `aq_mapping` table in the firmware: 5 rows (one per device type) x 6 RGB
+  # triples. Row 1 is this unit:
+  #     idx 0 #FFFFFF white (no reading)   idx 3 #FFFF00 yellow
+  #     idx 1 #0000FF blue                 idx 4 #FF1900 orange
+  #     idx 2 #00FF00 green                idx 5 #FF0000 red
+  # The index comes from PM2.5 against thresholds [10, 25, 35, 50] -- the
+  # firmware keeps three pollutant channels with separate thresholds and this
+  # model uses channel 1. See the pm2_5 sensor for the mapping.
+  - platform: ledc
+    id: rgb_r
+    pin: GPIO32
+    channel: 2
+    frequency: 5000Hz
+  - platform: ledc
+    id: rgb_g
+    pin: GPIO22
+    channel: 3
+    frequency: 5000Hz
+  - platform: ledc
+    id: rgb_b
+    pin: GPIO19
+    channel: 4
+    frequency: 5000Hz
+  - platform: ledc
+    id: indicator_pwm
+    pin: GPIO18
+    channel: 5
+    frequency: 5000Hz
+  - platform: ledc
+    id: backlight_pwm
+    pin: GPIO15
+    channel: 6
+    frequency: 5000Hz
+
+# ---------------------------------------------------------------------------
+# Fan
+#
+# Deliberately NOT reproducing stock behaviour here. Stock exposed four
+# discrete presets cycled by a button -- duty 1, 11, 51 and 91 %, which line up
+# with the panel lamps as Sleep / Speed 1 / Speed 2 / Speed 3. This gives a
+# continuous 0-100 % slider instead.
+#
+# The slider is a true 0-100 % duty control (see the fan_pwm output above).
+# Stock never went past 91 % duty; that cap is not applied here, so watch Fan
+# Current at 100 % before leaving it there long-term.
+# ---------------------------------------------------------------------------
+fan:
+  - platform: speed
+    id: main_fan
+    name: Fan
+    output: fan_pwm
+    restore_mode: RESTORE_DEFAULT_OFF
+    on_turn_on:
+      - output.turn_on: fan_enable
+      - script.execute: update_speed_lamps
+    on_turn_off:
+      - output.turn_off: fan_enable
+      - script.execute: update_speed_lamps
+    on_speed_set:
+      - script.execute: update_speed_lamps
+
+# ---------------------------------------------------------------------------
+# Panel feedback: light the speed lamp nearest the current fan percentage.
+#
+# Boundaries are the midpoints between stock's own four duty presets
+# (1 / 11 / 51 / 91 %), so the lamp shows which stock mode the continuous
+# setting is closest to:
+#
+#     off        no lamp
+#     1 - 5 %    Sleep
+#     6 - 30 %   Speed 1
+#     31 - 70 %  Speed 2
+#     71 %+      Speed 3
+#
+# Exactly one lamp at a time, matching how the original panel behaved.
+# ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# Filter life -- a faithful port of the stock algorithm.
+#
+#   once per minute, while the fan runs:
+#       airflow = AIRFLOW[speed band]                    m3/h
+#       inc     = pm2_5 * airflow * COEFF[pm2_5] / 60    ug this minute
+#       inc     = clamp(inc, 18, 27)
+#       used   += inc
+#
+# Every constant is a firmware value. The clamp looks like it throws away the
+# signal -- unclamped the increment reaches 525 ug/min at pm=100 against a cap
+# of 27 -- but it is not a bug, it IS the specification: 7,000,000 ug at
+# 18-27 ug/min works out to 180-270 days of running, and the user manual says
+# the filter indicator turns red "some time between 6 and 9 months of
+# operation, depending on usage and your air quality conditions." The clamps
+# are what produce that documented range.
+#
+# This was tried as a physical mass integral instead, without the clamp. Do
+# not repeat that: it gave 26 days at pm=35, seven times outside the
+# manufacturer's stated range. PM2.5 is a poor proxy for total dust load
+# (coarse dust, lint and dander dominate the mass and no sensor here sees
+# them), which is exactly what the clamp and the COEFF floor compensate for.
+#
+# COEFF holds the effective concentration near 15-22 ug/m3 at low readings, so
+# the filter still ages in clean air -- and because of that floor this works
+# correctly even while the PM sensor reads nothing.
+# ---------------------------------------------------------------------------
+interval:
+  - interval: 60s
+    then:
+      - lambda: |-
+          if (!id(main_fan).state) return;
+          const int duty = (int) id(main_fan).speed;
+          if (duty <= 0) return;
+
+          // AIRFLOW[band] in m3/h for filter type 1. The firmware really does
+          // work in m3/h: it divides by 3600 and multiplies by 60, converting
+          // to m3 per minute. Bands are 1-10 / 11-35 / 36-70 / 71-100 % duty.
+          int airflow;
+          if      (duty <= 10) airflow = 70;
+          else if (duty <= 35) airflow = 140;
+          else if (duty <= 70) airflow = 210;
+          else                 airflow = 315;
+
+          static const float COEFF[22] = {
+            1.0f, 15.3f, 7.6f, 5.1f, 3.8f, 3.7f, 3.2f, 2.9f, 2.5f, 2.3f, 2.0f,
+            1.9f, 1.7f, 1.6f, 1.5f, 1.4f, 1.3f, 1.2f, 1.2f, 1.1f, 1.1f, 1.1f };
+
+          float pmf = id(pm2_5).state;
+          if (std::isnan(pmf) || pmf < 0.0f) pmf = 0.0f;
+          const int pm = (int) (pmf + 0.5f);
+          const float coeff = (pm >= 22) ? 1.0f : COEFF[pm];
+
+          float inc = (float) pm * (float) airflow * coeff / 60.0f;
+          if (inc > 27.0f) inc = 27.0f;
+          if (inc < 18.0f) inc = 18.0f;
+          id(filter_used_ug) += inc;
+
+script:
+  # Filter reset -- stock does this on a long press of the fan pad.
+  - id: reset_filter
+    then:
+      - lambda: 'id(filter_used_ug) = 0.0f;'
+      - logger.log:
+          format: "filter life reset"
+          level: INFO
+
+  # Fan preset cycling for the physical Fan pad: 1 -> 11 -> 51 -> 91 -> 1 %.
+  # These are stock's own four presets (Sleep / Speed 1 / Speed 2 / Speed 3),
+  # so the panel lamps line up with the button exactly as they used to. From
+  # off, or from any intermediate slider value, it jumps to the next preset
+  # above the current speed.
+  - id: cycle_fan_speed
+    mode: single
+    then:
+      - lambda: |-
+          static const int PRESETS[4] = {1, 11, 51, 91};
+          const int cur = id(main_fan).state ? (int) id(main_fan).speed : -1;
+          int next = PRESETS[0];            // wraps here when past the last
+          for (int i = 0; i < 4; i++) {
+            if (PRESETS[i] > cur) { next = PRESETS[i]; break; }
+          }
+          auto call = id(main_fan).turn_on();
+          call.set_speed(next);
+          call.perform();
+
+  - id: update_speed_lamps
+    mode: restart
+    then:
+      - if:
+          condition:
+            lambda: 'return id(main_fan).state && id(main_fan).speed >= 1 && id(main_fan).speed < 6;'
+          then:
+            - light.turn_on: ui_sleep
+          else:
+            - light.turn_off: ui_sleep
+      - if:
+          condition:
+            lambda: 'return id(main_fan).state && id(main_fan).speed >= 6 && id(main_fan).speed < 31;'
+          then:
+            - light.turn_on: ui_speed1
+          else:
+            - light.turn_off: ui_speed1
+      - if:
+          condition:
+            lambda: 'return id(main_fan).state && id(main_fan).speed >= 31 && id(main_fan).speed < 71;'
+          then:
+            - light.turn_on: ui_speed2
+          else:
+            - light.turn_off: ui_speed2
+      - if:
+          condition:
+            lambda: 'return id(main_fan).state && id(main_fan).speed >= 71;'
+          then:
+            - light.turn_on: ui_speed3
+          else:
+            - light.turn_off: ui_speed3
+
+light:
+  - platform: rgb
+    name: Status LED
+    id: status_led
+    red: rgb_r
+    green: rgb_g
+    blue: rgb_b
+    restore_mode: RESTORE_DEFAULT_ON
+  - platform: monochromatic
+    name: Indicator
+    output: indicator_pwm
+    restore_mode: RESTORE_DEFAULT_OFF
+  # NOT an independent lamp. Confirmed on hardware: the driver's COM pin (the
+  # supply rail for all ten open-drain channels) is fed from this PWM, so this
+  # is the MASTER BRIGHTNESS for the whole lamp bank -- no lamp lights while
+  # it is off. Stock does the same: it drives this channel straight from the
+  # global brightness value.
+  - platform: monochromatic
+    name: Panel Brightness
+    id: panel_brightness
+    output: backlight_pwm
+    restore_mode: RESTORE_DEFAULT_ON
+
+  # The six driver-fed lamps need entities, or the outputs above are declared
+  # but unreachable. All are gated by Panel Brightness above.
+  #
+  # Nothing drives these automatically -- they are plain indicators. Point an
+  # automation at them if you want the front panel to reflect fan state again.
+  - platform: binary
+    name: Lamp Speed 1
+    id: ui_speed1
+    output: lamp_speed1
+    restore_mode: RESTORE_DEFAULT_OFF
+  - platform: binary
+    name: Lamp Speed 2
+    id: ui_speed2
+    output: lamp_speed2
+    restore_mode: RESTORE_DEFAULT_OFF
+  - platform: binary
+    name: Lamp Speed 3
+    id: ui_speed3
+    output: lamp_speed3
+    restore_mode: RESTORE_DEFAULT_OFF
+  - platform: binary
+    name: Lamp Auto
+    output: lamp_auto
+    restore_mode: RESTORE_DEFAULT_OFF
+  - platform: binary
+    name: Lamp Sleep
+    id: ui_sleep
+    output: lamp_sleep
+    restore_mode: RESTORE_DEFAULT_OFF
+  # Red LED. The firmware lights exactly this index on the filter-exhausted
+  # path (log string "=========FILTER WARNING!").
+  - platform: binary
+    name: Lamp Filter
+    id: ui_filter
+    output: lamp_filter
+    restore_mode: RESTORE_DEFAULT_OFF
+
+switch:
+  - platform: output
+    name: Ionizer
+    output: ionizer_output
+    restore_mode: RESTORE_DEFAULT_OFF
+
+button:
+  # Clean restart. Matters for testing persistence: shutdown flushes pending
+  # preference writes, a power cut does not.
+  - platform: restart
+    name: Restart
+
+  - platform: template
+    name: Reset Filter Life
+    icon: mdi:air-filter
+    entity_category: config
+    on_press:
+      - script.execute: reset_filter
+
+
+# ---------------------------------------------------------------------------
+# Buttons -- capacitive touch pads, not mechanical switches. An ICMAN SC02A
+# (SOP-8, 2-channel capacitive touch sensor) sits between the pads and the
+# ESP32 and drives these two GPIOs push-pull, which is why no pull-up is
+# configured. Active low.
+#
+# [GAP] Stock also writes three I2C config registers to the SC02A at boot
+# (see the I2C note below). This config does not, so the touch front-end runs
+# on its power-on defaults. If button sensitivity is wrong, that is the first
+# thing to look at.
+# ---------------------------------------------------------------------------
+binary_sensor:
+  # Power pad -- toggles the fan on/off.
+  - platform: gpio
+    name: Power Button
+    id: btn_power
+    pin:
+      number: GPIO4
+      inverted: true
+    filters:
+      - delayed_on_off: 50ms
+    on_press:
+      - fan.toggle: main_fan
+
+  # Fan pad -- steps through the four original speed presets. The Home
+  # Assistant slider stays continuous; this just gives the physical button its
+  # old behaviour back.
+  - platform: gpio
+    name: Fan Button
+    id: btn_fan
+    pin:
+      number: GPIO2
+      inverted: true
+    filters:
+      - delayed_on_off: 50ms
+    # Short press cycles speed; a 15 s hold resets filter life, as stock does.
+    # Uses on_click rather than on_press so the two can be told apart -- the
+    # speed change therefore lands on release, not on touch.
+    on_click:
+      - min_length: 50ms
+        max_length: 1s
+        then:
+          - script.execute: cycle_fan_speed
+      # The manual specifies an "extra long press" of ~15 s for filter reset,
+      # confirmed against the stock UI. Deliberately awkward so it cannot be
+      # triggered by accident.
+      - min_length: 15s
+        max_length: 25s
+        then:
+          - script.execute: reset_filter
+
+# (cycle_fan_speed lives in the script: block further up, next to
+#  update_speed_lamps -- ESPHome allows only one top-level script: key.)
+
+# ---------------------------------------------------------------------------
+# Particulate sensor -- UART1, TX GPIO26 / RX GPIO34, 9600 8N1.
+#
+# The part is a Cubic PM1003 (stock tags it MCU_PM1003ph), but it speaks the
+# PM1006 wire protocol exactly, verified against the stock driver in both
+# directions:
+#     request           11 02 0B 01 E1        (identical)
+#     response header   16 11 0B              (identical)
+#     frame length      0x14 = 20 bytes       (identical)
+#     checksum          two's complement of the first 19 bytes
+# So ESPHome's pm1006 component parses it unmodified.
+#
+# One difference, in stock's favour to know about but not to copy: stock
+# computes DF3*255 + DF4 where the standard is DF3*256 + DF4. Identical below
+# 256 ug/m3; above that stock reads ~0.4 % low. ESPHome's is correct.
+# ---------------------------------------------------------------------------
+#
+# If PM2.5 reads NA it is NOT a protocol problem (see above -- request,
+# header, length and checksum all match stock exactly). ESPHome does poll:
+# pm1006's update() transmits the request frame. Silence means the sensor is
+# not answering, so check, in order: is the module plugged in; is Q1 actually
+# powering it (the PM1003 has an internal fan you can hear spin up); has it
+# had ~30 s to warm up. Uncomment the debug block to see raw traffic -- TX
+# with no RX means unpowered or unwired.
+text_sensor:
+  - platform: template
+    name: Air Quality
+    icon: mdi:air-filter
+    update_interval: 30s
+    lambda: |-
+      const float x = id(pm2_5).state;
+      if (std::isnan(x)) return {"Unknown"};
+      if (x <= 10.0f)    return {"Excellent"};
+      if (x <= 25.0f)    return {"Good"};
+      if (x <= 35.0f)    return {"Moderate"};
+      if (x <= 50.0f)    return {"Polluted"};
+      return {"Very polluted"};
+
+uart:
+  id: pm_uart
+  tx_pin: GPIO26
+  rx_pin: GPIO34
+  baud_rate: 9600
+  # Temporary, for diagnosing the NA reading. dummy_receiver MUST stay false
+  # so pm1006 still gets the bytes. Framed on an idle gap, not a delimiter --
+  # this is a binary protocol with no line endings.
+  debug:
+    direction: BOTH
+    dummy_receiver: false
+    after:
+      timeout: 50ms
+    sequence:
+      - lambda: UARTDebug::log_hex(direction, bytes, ' ');
+
+sensor:
+  - platform: pm1006
+    uart_id: pm_uart
+    # Explicit: without this the PollingComponent default is 60 s, so the
+    # request frame only goes out once a minute -- easy to mistake for "no
+    # traffic at all" when watching the log.
+    update_interval: 10s
+    pm_2_5:
+      id: pm2_5
+      name: PM2.5
+      # Drive the RGB ring as the Air Quality Indicator, which is what it is
+      # for -- the manual describes 5 colours from "excellent" to "very
+      # polluted". Thresholds and colours are firmware values, see the
+      # aq_mapping note below.
+      on_value:
+        then:
+          - lambda: |-
+              // aq_mapping table, row for type 1 (this unit):
+              //   0 white  1 blue  2 green  3 yellow  4 orange  5 red
+              // index 0 is the "no reading" colour.
+              static const float R[6] = {1.0f, 0.0f, 0.0f, 1.0f, 1.0f, 1.0f};
+              static const float G[6] = {1.0f, 0.0f, 1.0f, 1.0f, 0.098f, 0.0f};
+              static const float B[6] = {1.0f, 1.0f, 0.0f, 0.0f, 0.0f, 0.0f};
+
+              int idx;
+              if      (std::isnan(x)) idx = 0;
+              else if (x <= 10.0f)    idx = 1;   // excellent
+              else if (x <= 25.0f)    idx = 2;   // good
+              else if (x <= 35.0f)    idx = 3;   // moderate
+              else if (x <= 50.0f)    idx = 4;   // polluted
+              else                    idx = 5;   // very polluted
+
+              // make_call() leaves the on/off state alone, so the ring can
+              // still be switched off manually without this turning it back on
+              auto call = id(status_led).make_call();
+              call.set_rgb(R[idx], G[idx], B[idx]);
+              call.perform();
+
+  # Fan tachometer. Stock captures the negative edge; the equivalent signal is
+  # labelled "FG" on a sibling board, i.e. a conventional tach output.
+  - platform: pulse_counter
+    pin:
+      number: GPIO27
+      mode:
+        input: true
+    id: fan_tach
+    name: Fan RPM
+    unit_of_measurement: RPM
+    count_mode:
+      rising_edge: DISABLE
+      falling_edge: INCREMENT
+    filters:
+      # 6 pulses/rev, measured: at 91 % duty the raw count was 10090 pulses/min,
+      # and 10090/6 = 1682 RPM, matching the stock motor table's 1720/1520/1640
+      # ceilings. No other divisor lands in range (2 -> 5045, 4 -> 2523).
+      # 6 pulses/rev = a 12-pole BLDC, normal for an appliance motor.
+      - multiply: 0.1666667
+    update_interval: 5s
+
+  # Fan motor current sense (ADC1_CH7), 12-bit / 6 dB as stock.
+  - platform: adc
+    pin: GPIO35
+    id: fan_current
+    name: Fan Current
+    attenuation: 6db
+    # Sampling matches stock exactly, all values read out of the firmware:
+    #   - the virtual-MCU timer tick is 1 ms (periodic esp_timer, 1000 us)
+    #   - the current check reschedules itself with 100 ticks => every 100 ms
+    #   - its filter buffers 20 samples, sorts them, discards min and max and
+    #     averages the middle 18 (divisor read as 18.0); it returns -1.0 while
+    #     still accumulating, so a value is only evaluated every 20th sample
+    # => one evaluated value every 2.0 s. Median here rather than a trimmed
+    # mean; both reject the outliers that PWM chopping produces.
+    update_interval: 100ms
+    filters:
+      - median:
+          window_size: 20
+          send_every: 20
+    # Overcurrent protection, reproducing stock's strike counter rather than
+    # tripping on a single crossing. Stock starts a counter at 3, decrements
+    # it on each over-limit value and cuts out at 0 -- but RESETS it to 3 the
+    # moment a value comes in under the limit. So it takes 3 consecutive
+    # over-limit values (3 x 2.0 s = 6.0 s) and any dip clears it.
+    #
+    # This matters: accelerating the fan briefly pushes the sense line well
+    # above steady state (1.80 V observed going 5 % -> 90 %, against a 1.52 V
+    # steady maximum). That transient is over long before 6 s.
+    #
+    # Like stock, only checked while the fan is actually running.
+    on_value:
+      then:
+        - lambda: |-
+            if (id(main_fan).state && x > ${overcurrent_volts}) {
+              id(oc_strikes) += 1;
+            } else {
+              id(oc_strikes) = 0;
+            }
+        - if:
+            condition:
+              lambda: 'return id(oc_strikes) >= 3;'
+            then:
+              - fan.turn_off: main_fan
+              - lambda: 'id(oc_strikes) = 0;'
+              - logger.log:
+                  format: "FAN OVERCURRENT: %.2f V above %s V for 6 s - fan stopped"
+                  args: ['id(fan_current).state', '"${overcurrent_volts}"']
+                  level: ERROR
+
+  # Filter life, as a percentage of capacity consumed.
+  - platform: template
+    id: filter_used_pct
+    name: Filter Used
+    unit_of_measurement: "%"
+    icon: mdi:air-filter
+    accuracy_decimals: 1
+    update_interval: 30s
+    lambda: 'return 100.0f * id(filter_used_ug) / ${filter_capacity_ug}.0f;'
+    on_value:
+      then:
+        - if:
+            condition:
+              lambda: 'return x >= 100.0f;'
+            then:
+              - light.turn_on: ui_filter
+            else:
+              - light.turn_off: ui_filter
+
+  # The raw accumulator behind Filter Used.
+  - platform: template
+    name: Filter Dust Captured
+    unit_of_measurement: mg
+    icon: mdi:weather-dust
+    accuracy_decimals: 1
+    entity_category: diagnostic
+    update_interval: 60s
+    lambda: 'return id(filter_used_ug) / 1000.0f;'
+
+  # Supply / power-fail sense (ADC1_CH0).
+  - platform: adc
+    pin: GPIO36
+    name: Supply Voltage
+    attenuation: 6db
+    update_interval: 10s
+
+# ---------------------------------------------------------------------------
+# NOT included, deliberately:
+#
+#   I2C1 (SDA GPIO0 / SCL GPIO5, 100 kHz). Two devices:
+#
+#     0x54 -- 24C32A EEPROM (32-byte pages, 16-bit word address). Offset 0x100
+#             holds a 39-byte PERSISTENT DEVICE STATE block (not sensor
+#             calibration -- an earlier reading of this was wrong):
+#               0x104 fan speed      0x107 filter_capacity_used  (4 B)
+#               0x105 brightness     0x10B filter_capacity_total (4 B)
+#               0x106 night bright.  0x10F filter_mass_backlog   (4 B)
+#               0x11B motor type     0x11F fan setpoints 1-4 (u16 x4)
+#             and 0x400 holds a 20-byte serial string.
+#             [GAP] none of it is read or written here. Nothing about PM2.5
+#             accuracy depends on it. The device's accumulated filter life
+#             survives flashing untouched, but is neither shown nor updated.
+#
+#     0x18 -- almost certainly the SC02A touch controller. Stock writes
+#             [2,0], [3,0], [1,0] once at boot and never reads it.
+#
+#   GPIO0 is a boot strapping pin, so the bus is left out for now. To probe:
+#
+#     i2c:
+#       sda: GPIO0
+#       scl: GPIO5
+#       frequency: 100kHz
+#       scan: true
+#
+#   Filter-life tracking is not reproduced. It is measured in accumulated
+#   micrograms, not hours, and lives in the EEPROM above (used/total/backlog);
+#   stock resets it on a long press of the fan pad and lights Lamp Filter when
+#   exhausted.
+#
+#   ADC1_CH3 (GPIO39) is configured by stock but never read on this variant.
+# ---------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
+# Status
+#
+# Confirmed on hardware: both touch pads, fan (PWM + enable + tacho at 6
+# pulses/rev), RGB colour order, indicator, panel brightness, all six panel
+# lamps, ionizer, NVS persistence, and the fan current curve
+# (1 % 0.11 V / 11 % 0.11 V / 51 % 0.51 V / 91 % 1.49 V / 100 % 1.51 V).
+#
+# Open:
+#   - PM2.5 reads 0. The protocol is verified working (valid frames, checksum
+#     correct, and stock parses the same two bytes), so this is airflow or
+#     genuinely clean air rather than a driver problem. Positive control: run
+#     the fan, wait past the 60 s stock warm-up, then hold incense or a just-
+#     blown-out match near the intake and watch for a jump.
+#   - Q2 (chip pin 9) is unused by stock; never driven, purpose unknown.
+#   - The 1.72 V overcurrent limit is the firmware constant for motor type 1.
+#     Stock divides the ADC reading by 1.10 before comparing, which would put
+#     the real trip nearer 1.89 V -- that float call could not be decoded with
+#     confidence, so 1.72 V is used: conservative, trips earlier, never later.
+#   - The uart debug block above is diagnostic; remove it once PM2.5 reads.
+# ---------------------------------------------------------------------------

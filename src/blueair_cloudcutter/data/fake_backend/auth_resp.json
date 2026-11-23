@@ -1,0 +1,10 @@
+{
+  "access_token": "eyJhbGciOiJSUzI1NiJ9.eyJzdWIiOiJmYWtlLWRldmljZSIsInRva2VuX3VzZSI6ImFjY2VzcyIsImV4cCI6NDEwMjQ0NDgwMH0.c2ln",
+  "refresh_token": "fake-refresh-token",
+  "id_token": "eyJhbGciOiJSUzI1NiJ9.eyJzdWIiOiJmYWtlLWRldmljZSIsInRva2VuX3VzZSI6ImlkIiwiZXhwIjo0MTAyNDQ0ODAwfQ.c2ln",
+  "ba_X-Amz-CustomAuthorizer-Signature": "fake-signature",
+  "ba_X-Amz-CustomAuthorizer-Name": "custom-authorizer",
+  "ba_X-Amz-CustomAuthorizer-Token": "eyJhbGciOiJSUzI1NiJ9.eyJzdWIiOiJmYWtlLWRldmljZSIsInRva2VuX3VzZSI6ImFjY2VzcyIsImV4cCI6NDEwMjQ0NDgwMH0.c2ln",
+  "token_type": "Bearer",
+  "expires_in": 86400
+}

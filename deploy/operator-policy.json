@@ -1,0 +1,23 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "Iot",
+      "Effect": "Allow",
+      "Action": [
+        "iot:DescribeEndpoint",
+        "iot:CreatePolicy",
+        "iot:GetPolicy",
+        "iot:CreateThing",
+        "iot:DescribeThing",
+        "iot:AttachPolicy",
+        "iot:AttachThingPrincipal",
+        "iot:RegisterCertificateWithoutCA",
+        "iot:DescribeCertificate",
+        "iot:UpdateCertificate",
+        "iot:CreateKeysAndCertificate"
+      ],
+      "Resource": "*"
+    }
+  ]
+}
