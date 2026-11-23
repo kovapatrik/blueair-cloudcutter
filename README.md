@@ -104,7 +104,7 @@ Keep `output/` private. The control keys can publish to your devices.
 
 As written in the writeup as well, AI was heavily used in the reverse engineering of
 the binary to find the actual exploit. Before that, I found the actual paths to going 
-forward with the exploit. I also used it to generate this tool.
+forward with the exploit. I also used AI to generate this tool.
 I spent a lot of time figuring out the exploit and finding the holes, and I think
 based on the concept, AI could write a better code than me. The writeup and part of 
 the documentation was written by me.

@@ -48,7 +48,7 @@ After capturing it, and adding it to AWS, the device successfully connected to m
 
 ## MQTT topic
 
-The device posts status updates to the broker. Using this, it was easily reverse engineer-able the way the device can be controlled. So at this point, it was achieved that the device can be controlled through my own AWS broker, but the goal was to control it using remotely.
+The device posts status updates to the broker. Using this, it was easily reverse engineer-able the way the device can be controlled. So at this point, it was achieved that the device can be controlled through my own AWS broker, but the goal was to control it locally.
 
 The device has it's own topic prefix, so each topic mentioned after this has to be appended after `d/<DEVICE_ID>/`. Device ID can be gained from the broker, either by looking on where the device subscribes (by looking at Cloudwatch logs) or by reading the JSON the device pushes to the topic each time it reboots.
 
@@ -73,7 +73,7 @@ Sending JSONs to the `prov` topic without setting `_t` to `Diff` will list all t
 
 ## Local controlling the device
 
-There is a certificate called `c-r`, which I thought will be the root certificate, so I tried to write it. I created my root certificate, issued an intermediate and a leaf certificate. Then I made a `mosquitto` server, which were using these certificates, and I overwrote the device's `c-r` certificate using the `prov` topic. After this, I re-provisioned it to my own local broker (by setting `broker_url` to a local IP, like `192.168.0.2`). After this the device successfully connected to my local broker.
+There is a certificate called `c-r`, which I thought will be the root certificate, so I tried to write it. I created my root certificate, issued an intermediate and a leaf certificate. Then I made a `mosquitto` server, which were using these certificates, and I overwrote the device's `c-r` certificate using the `prov` topic. After this, I re-provisioned it to my own local broker (by setting `broker_url` to a local hostname, like `broker.lan`). After this the device successfully connected to my local broker.
 
 With this method **local control of the device was achieved**, the air purifier is liberated.
 
@@ -250,7 +250,7 @@ But OTA updating through factory mode gave me a new thing: it doesn't erase the 
 
 ## Activate the inactive OTA partition
 
-Flashing the official Blueair firmware through the factory mode, of course, successes, which is then boots up the other OTA partition, so I have a way to flip to the other partition. I just need a way to flash a custom image after this flip happens.
+Flashing the official BlueAir firmware through the factory mode, of course, successes, which is then boots up the other OTA partition, so I have a way to flip to the other partition. I just need a way to flash a custom image after this flip happens.
 
 Both the AWS OTA, and the factory mode image provisioning can take multiple images in the same request. The `target` field, which was fuzzed before, can be set to `STM32` as well. I guess some devices has a separate MCU next to the ESP32, which can be updated using this. AI found a "bug" in the `STM32` update branch, which is specific to the factory mode image provisioning: if the update fails with an `MCU buff is too small` error, the device is not restarting and not erasing anything. 
 
