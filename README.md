@@ -15,6 +15,9 @@ Local control and custom firmware for BlueAir air purifiers that talk to AWS IoT
 > unbootable until you restore a flash dump over UART. Make a dump first if you
 > plan to flash custom firmware.
 
+I'm fairly sure the local control part of this tool can be applied to any AWS based BlueAir device
+but I cannot prove this until people report this.
+
 ## What it does
 
 | Goal | What changes | Reversible |
