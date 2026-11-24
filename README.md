@@ -6,7 +6,8 @@ Local control and custom firmware for BlueAir air purifiers that talk to AWS IoT
 > In the current stage, it's hardly advised to create a flash dump through UART!
 > This has been only tested on only one device: Blue Pure 411i Max / Blue Max 3250i
 > It's not guaranteed to work on other models, not even on another model of this very
-> same type (although it should work.) Use this at your own risk!
+> same type (although it should work.) The local control route is fairly low-risk, but 
+> nothing is guaranteed. Use this at your own risk!
 
 > [!WARNING]
 > This tool writes firmware and configuration to hardware you own. It is not

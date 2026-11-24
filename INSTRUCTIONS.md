@@ -1,6 +1,6 @@
 # Instructions
 
-This is the step-by-step path for a normal user. The [README](README.md) is the
+This is the step-by-step guide for tool. The [README](README.md) is the
 overview, and the manual routes and recovery commands are in
 [`docs/manual.md`](docs/manual.md).
 
